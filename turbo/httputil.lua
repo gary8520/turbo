@@ -753,6 +753,205 @@ httputil.streaming_parse_multipart_data = function(serverhandle, data)
     end
 end
 
+ffi.cdef[[
+typedef unsigned int size_t
+typedef FILE void
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
+]]
+
+function httputil.streaming_parse_multpart_large_body(serverhandle)
+    init_streaming_parse_mulitpart(serverhandle)
+    local swork = serverhandle._stream_work
+    local begin_boundary = swork.boundary .. "\r\n"
+    local next_boundary = "\r\n" .. swork.boundary .. "\r\n"
+    local close_boundary = "\r\n" .. swork.boundary .. "--"
+    local boundary_size = #next_boundary
+    begin_boundary = ffi.cast("char *", begin_boundary)
+    next_boundary = ffi.cast("char *", next_boundary)
+    close_boundary = ffi.cast("char *", close_boundary)
+    
+    local stream = serverhandle.stream
+    local _socketdata, _socketdata_len
+    local buffer_continue = buffer(5120)
+    local Simpledata = class("Simpledata")
+    function Simpledata:initialize()
+        -- just init
+        self._ptr = ffi.cast("char *", "")
+        self._len = 0
+        self._used = 0
+    end
+    function Simpledata:renew(ptr, len)
+        self._ptr = ptr
+        self._len = len
+        self._used = 0
+    end
+    function Simpledata:unused() return self._ptr + self._used end
+    function Simpledata:unused_len() return self._len - self._used end
+    function Simpledata:shift(bytes) self._used = self._used + bytes end
+    function Simpledata:strfind(fstr, flen)
+        local ptr = util.str_find(self:unused(), fstr, self:unsed_len(), flen)
+        if ptr then
+            return ptr - self:unsed()
+        else
+            return nil
+        end
+    end
+    function Simpledata:substrbytes(bytes) return ffi.string(self:unsed(), bytes) end
+    function Simpledata:possible_boundary(boundary, boundary_size)
+        local start_find, rest_len
+        if self:unused_len() > boundary_size then
+            start_find = self._ptr + self._len - boundary_size
+            rest_len = boundary_size
+        else
+            start_find = self:unused()
+            rest_len = self:unused_len()
+        end
+        -- find just onebyte consider as possible
+        local ptr = util.str_find(start_find, boundary, boundary_size, 1)
+        if ptr then
+            return ptr - self:unsed()
+        else
+            return nil
+        end
+    end
+
+    local data = Simpledata:new()
+
+    -- state functions
+    local function state_begin_boundary()
+        local start_offset = data:strfind(begin_boundary, boundary_size -2)
+        if start_offset then
+            -- ignore all data before begin boundary
+            data:shift(boundary_size -2)
+            return "headers"
+        else
+            return false
+        end
+    end
+    local function state_part_headers()
+        local start_offset = data:strfind("\r\n\r\n", 4)
+        if start_offset ~= nil then
+            --headers with tailing \r\n
+            if start_offset > 512 then error("part header too long") end
+            push_streaming_multipart_headers(serverhandle, data:substrbytes(start_offset))
+            data:shift(start_offset + 4)
+            return "body"
+        else
+            return false
+        end
+    end
+    local function state_part_body()
+        local nb_start_offset = data:strfind(next_boundary, boundary_size)
+        local cb_start_offset = data:strfind(close_boundary, boundary_size)
+        if data:unsed_len() >= 512 then
+            local tmpname = os.tmpname()
+            local file = io.open(tmpname, "w")
+            assert(file, "open file faild:" .. tmpname)
+            swork.tmpname = tmpname
+            swork.tmpfile = file
+            return "large_body"
+        elseif nb_start_offset then
+            push_streaming_multipart_body(serverhandle, data:substrbytes(nb_start_offset))
+            data:shift(nb_start_offset + boundary_size)
+            return "headers"
+        elseif cb_start_offset then
+            push_streaming_multipart_body(serverhandle, data:substrbytes(cb_start_offset))
+            data:shift(cb_start_offset + boundary_size)
+            return "close"
+        else
+            return false
+        end
+    end
+    local function state_part_large_body()
+        local nb_start_offset = data:strfind(next_boundary, boundary_size)
+        local cb_start_offset = data:strfind(close_boundary, boundary_size)
+        local tmpname = swork.tmpname
+        if not tmpname then
+            tmpname = os.tmpname()
+            swork.tmpname = tmpname
+        end
+        local file = swork.tmpfile
+        if not file then
+            file = io.open(tmpname, "a")
+            swork.tmpfile = file
+        end
+
+        if nb_start_offset then
+            ffi.C.fwrite(data:unused(), nb_start_offset, 1, file)
+            push_streaming_multipart_large_body(serverhandle)
+            collectgarbage()
+            data:shift(nb_start_offset + boundary_size)
+            return "headers"
+        elseif cb_start_offset then
+            ffi.C.fwrite(data:unused(), cb_start_offset, 1, file)
+            push_streaming_multipart_large_body(serverhandle)
+            data:shift(cb_start_offset + boundary_size)
+            collectgarbage()
+            return "close"
+        elseif buffer_len >= 3*boundary_size then
+            -- need to hold at least 1x boundary_size bytes to capture
+            -- whole boundary in next time
+            local offset = data:possible_boundary(next_boundary, boundary_size)
+            if offset ~= nil then
+                ffi.C.fwrite(data:unused(), offset, 1, file)
+                data:shift(offset)
+            else
+                ffi.C.fwrite(data:unused(), data:unused_len(), 1, file)
+                data:shift(data:unused_len())
+            end
+            collectgarbage()
+            return "large_body"
+        else
+            return false
+        end
+    end
+    local function state_close()
+        collectgarbage()
+        return false
+    end
+    local state_function_map = {
+        start = state_begin_boundary,
+        headers = state_part_headers,
+        body = state_part_body,
+        large_body = state_part_large_body,
+        close = state_close,
+    }
+    local state = "start"
+
+    local use_continue = false
+    repeat
+        -- each loop read from socket, if 
+        _socketdata, _socketdata_len = stream:_read_from_socket()
+        if use_continue then
+            buffer_continue:append_right(_socketdata, _socketdata_len)
+            data:renew(buffer_continue:get())
+        else
+            data:renew(_socketdata, _socketdata_len)
+        end
+
+        -- state transfer
+        local next_state
+        repeat
+            next_state = state_function_map[state]()
+            state = next_state or state
+            swork.state = state
+        until next_state == false
+
+        if data:unused_len() > 0 then
+            if use_continue then
+                buffer_continue:pop_left(_data_used)
+            else
+                buffer_continue:clear()
+                buffer_continue:append_right(_socketdata + _data_used, _socketdata_len - _data_used)
+            end
+            use_continue = true
+        else
+            use_continue = false
+        end
+    until _socketdata
+
+end
+
 --*************** HTTP Header generation ***************
 
 
