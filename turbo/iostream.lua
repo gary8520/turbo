@@ -243,6 +243,14 @@ function iostream.IOStream:read_bytes(num_bytes, callback, arg,
     self:_initial_read()
 end
 
+function iostream.IOStream:read_bytes_raw_buffer(num_bytes, callback, arg,
+    streaming_callback, streaming_arg)
+    self._raw_buffer = true
+    self:read_bytes(num_bytes, callback, arg,
+    streaming_callback, streaming_arg)
+end
+
+
 
 --- Reads all data from the socket until it is closed.
 -- If a streaming_callback argument is given, it will be called with chunks of
@@ -640,11 +648,14 @@ if platform.__LINUX__ and not _G.__TURBO_USE_LUASOCKET__ then
                                    TURBO_SOCKET_BUFFER_SZ < buffer_left and
                                        TURBO_SOCKET_BUFFER_SZ or buffer_left,
                                    0))
+                                   print("gary after recv", sz)
         if sz == -1 then
             errno = ffi.errno()
             if errno == EWOULDBLOCK or errno == EAGAIN then
+                print("gary errno == EWOULDBLOCK or errno == EAGAIN", errno)
                 return
             elseif errno == ECONNRESET then
+                print("gary errno == ECONNERESET", errno)
                 self:close()
                 return nil
             else
@@ -725,7 +736,9 @@ end
 --- Read from the socket and append to the read buffer.
 --  @return Amount of bytes appended to self._read_buffer.
 function iostream.IOStream:_read_to_buffer()
+    print("gary in _read_tobuffer", debug.traceback())
     local ptr, sz, closed = self:_read_from_socket()
+    print("gary in _read_to_buffer after _read_from_socket", ptr, sz)
     if not ptr then
         if closed then
             self:close()
@@ -735,6 +748,7 @@ function iostream.IOStream:_read_to_buffer()
     end
     self._read_buffer:append_right(ptr, sz)
     self._read_buffer_size = self._read_buffer_size + sz
+    print("gary after append_right", ptr, sz, self._read_buffer_size)
     if closed then
         self:close()
     end
@@ -757,24 +771,29 @@ end
 --- Attempts to complete the currently pending read from the buffer.
 -- @return (Boolean) Returns true if the enqued read was completed, else false.
 function iostream.IOStream:_read_from_buffer()
+    print("gary in read_from_buffer", self._streaming_callback , self._read_buffer_size )
     -- Handle streaming callbacks first.
     if self._streaming_callback ~= nil and self._read_buffer_size ~= 0 then
+        print"gary to be streaming"
         local bytes_to_consume = self._read_buffer_size
         if self._read_bytes ~= nil then
             bytes_to_consume = min(self._read_bytes, bytes_to_consume)
             self._read_bytes = self._read_bytes - bytes_to_consume
-            self:_run_callback(self._streaming_callback,
-                self._streaming_callback_arg,
-                self:_consume(bytes_to_consume))
+            --self:_run_callback(self._streaming_callback,
+            --    self._streaming_callback_arg,
+            --    self:_consume(bytes_to_consume))
+            self._streaming_callback(self._streaming_callback_arg, self:_consume(bytes_to_consume))
         else
-            self:_run_callback(self._streaming_callback,
-                self._streaming_callback_arg,
-                self:_consume(bytes_to_consume))
+            --self:_run_callback(self._streaming_callback,
+            --    self._streaming_callback_arg,
+            --    self:_consume(bytes_to_consume))
+            self._streaming_callback(self._streaming_callback_arg, self:_consume(bytes_to_consume))
         end
     end
     -- Handle read_bytes.
     if self._read_bytes ~= nil and
         self._read_buffer_size >= self._read_bytes then
+        print("gary _read_bytes ~= nil")
         local num_bytes = self._read_bytes
         local callback = self._read_callback
         local arg = self._read_callback_arg
@@ -1008,29 +1027,42 @@ end
 --- Add IO state to IOLoop.
 -- @param state (Number) IOLoop state to set.
 function iostream.IOStream:_add_io_state(state)
+    print("gary in _add_io_state", state)
     if not self.socket then
         -- Connection has been closed, ignore request.
         return
     end
     if not self._state then
+        print("gary in not self._state")
         self._state = bitor(ioloop.ERROR, state)
         self.io_loop:add_handler(self.socket,
             self._state,
             self._handle_events,
             self)
     elseif bitand(self._state, state) == 0 then
+        print("gary in bitand(self._state, state) == 0")
         self._state = bitor(self._state, state)
         self.io_loop:update_handler(self.socket, self._state)
     end
+    print("end of _add_io_state",debug.traceback())
 end
 
 function iostream.IOStream:_consume(loc)
     if loc == 0 then
-        return ""
+        if self._raw_buffer then
+            return {ptr=ffi.cast("char*", ""), len=0}
+        else
+            return ""
+        end
     end
     self._read_buffer_size = self._read_buffer_size - loc
     local ptr, sz = self._read_buffer:get()
-    local chunk = ffi.string(ptr + self._read_buffer_offset, loc)
+    local chunk
+    if self._raw_buffer then
+        chunk = {ptr = ptr + self._read_buffer_offset, len=loc}
+    else
+        chunk = ffi.string(ptr + self._read_buffer_offset, loc)
+    end
     self._read_buffer_offset = self._read_buffer_offset + loc
     if self._read_buffer_offset == sz then
         -- Buffer reached end. Reset offset and size.

@@ -112,6 +112,7 @@ end
 -- this as first argument if set.
 -- @return (Boolean) true if successfull else false.
 function ioloop.IOLoop:add_handler(fd, events, handler, arg)
+    print("gary in add_handler",fd, events, handler, arg)
     local rc, errno = self._poll:register(fd, bit.bor(events, ioloop.ERROR))
     if rc ~= 0 then
         log.notice(
@@ -130,6 +131,7 @@ end
 -- ioloop.READ and ioloop.WRITE. Multiple bits can be AND'ed together.
 -- @return (Boolean) true if successfull else false.
 function ioloop.IOLoop:update_handler(fd, events)
+    print("garin in update_handler", fd, events)
     local rc, errno = self._poll:modify(fd, bit.bor(events, ioloop.ERROR))
     if rc ~= 0 then
         log.notice(
@@ -145,6 +147,7 @@ end
 -- @param fd (Number) File descriptor to remove handler from.
 -- @return (Boolean) true if successfull else false.
 function ioloop.IOLoop:remove_handler(fd)
+    print("gary in remove_handler", fd)
     if not self._handlers[fd] then
         return
     end
@@ -348,6 +351,7 @@ function ioloop.IOLoop:start()
                 if co_cbs[i] ~= nil then
                     -- co_cbs[i][1] = coroutine (Lua thread).
                     -- co_cbs[i][2] = yielded function.
+                    print("gary call co_cbs")
                     if self:_resume_coroutine(
                         co_cbs[i][1],
                         co_cbs[i][2]) ~= 0 then
@@ -360,6 +364,7 @@ function ioloop.IOLoop:start()
         local callbacks = self._callbacks
         self._callbacks = {}
         for i = 1, #callbacks, 1 do
+            print(string.format("gary _run_callback(callbacks[%d])", i))
             if self:_run_callback(callbacks[i]) ~= 0 then
                 -- Function yielded and has been scheduled for next iteration.
                 -- Drop timeout.
@@ -448,6 +453,7 @@ if _poll_implementation == "epoll_ffi" then
     -- Linux version.
     function ioloop.IOLoop:_event_poll(poll_timeout)
         local rc, num, events = self._poll:poll(poll_timeout)
+        print("gary in _event_poll", rc, num, events)
         if rc == 0  then
             num = num - 1 -- Base 0 loop
             for i = 0, num do
@@ -529,6 +535,7 @@ end
 -- happen! If a handler errors, the handler is removed from the IOLoop, and
 -- never called again.
 function ioloop.IOLoop:_run_handler(fd, events)
+    print("gary in _run_handler", fd, events)
     local ok
     local handler = self._handlers[fd]
     if not handler then

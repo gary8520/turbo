@@ -127,7 +127,9 @@ function httpserver.HTTPConnection:initialize(stream, address,
     self.stream:set_maxed_buffer_callback(self._on_max_buffer, self)
     -- 18K max header size by default.
     self.stream:set_max_buffer_size(self.kwargs.max_header_size or 1024*18)
+    print("gary before call read_until")
     self.stream:read_until("\r\n\r\n", self._header_callback, self)
+    print("gary after call read_until")
 end
 
 function httpserver.HTTPConnection:_set_write_callback(callback, arg)
@@ -210,6 +212,7 @@ end
 --- Handles incoming headers. The HTTPHeaders class is used to parse
 -- request headers.
 function httpserver.HTTPConnection:_on_headers(data)
+    print("gary in _on_headers")
     local headers
     local status, headers = xpcall(httputil.HTTPParser,
         _on_headers_error_handler, data, httputil.hdr_t["HTTP_REQUEST"])
@@ -247,12 +250,16 @@ function httpserver.HTTPConnection:_on_headers(data)
 
             local content_type = self._request.headers:get("Content-Type")
             if type(self.kwargs.streaming_multipart_bytes) == "number" and
-		content_length >= self.kwargs.streaming_multipart_bytes and
+                content_length >= self.kwargs.streaming_multipart_bytes and
                 content_type:find("multipart/form-data", 1, true) then
+                print("gary in call streaming callback if")
                 local final_callback = function(self) self.request_callback(self._request) end
+                local stream_parse = httputil.StreamingParser:new(self)
 
-                self.stream:read_bytes(content_length, final_callback, self,
-			httputil.streaming_parse_multipart_data, self)
+                --self.stream:read_bytes(content_length, final_callback, self,
+                --    httputil.streaming_parse_multipart_data, self)
+                self.stream:read_bytes_raw_buffer(content_length, final_callback, self,
+                    stream_parse.parse_large_multipart_body, stream_parse)
             else
                 self.stream:read_bytes(content_length, self._on_request_body, self)
             end
