@@ -368,7 +368,6 @@ end
 -- type.
 -- @note Will throw error on parsing failure.
 function httputil.HTTPParser:parse_header(hdr_str, hdr_t)
-        print(debug.traceback())
     -- Ensure the string is not GCed while we are still using it by keeping a
     -- reference to it. There is no way for LuaJIT to know we are still
     -- using pointers to it.
@@ -559,13 +558,13 @@ end
 ffi.cdef[[
 typedef void FILE;
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+int fflush ( FILE * stream );
 ]]
 
 httputil.StreamingParser = class("StreamingParser")
 
 function httputil.StreamingParser:initialize(serverhandle)
     self.connection = serverhandle
-    print("gary in StreamingParser:initialize")
 
     local content_length = serverhandle._request.headers:get("Content-Length")
     content_length = tonumber(content_length)
@@ -596,11 +595,13 @@ function httputil.StreamingParser:initialize(serverhandle)
 
     serverhandle.arguments = {}
     self.arguments = serverhandle.arguments
-    self._read_buffer = serverhandle.stream._read_buffer
+    self.streaming_buffer = buffer(5120)
     self._ptr = ffi.cast("char *", "")
     self._len = 0
     self._used = 0
     self.state = "start"
+    self._total_used = 0
+    self._total_get = 0
 
     local kwargs = serverhandle.kwargs
     local large_body_bytes
@@ -613,10 +614,10 @@ function httputil.StreamingParser:initialize(serverhandle)
 end
 
 function httputil.StreamingParser:load_chunk(chunk)
-    print("gary load", ffi.string(chunk.ptr, 30), chunk.len)
-    self._ptr = chunk.ptr
-    self._len = chunk.len
+    self.streaming_buffer:append_right(chunk.ptr, chunk.len)
+    self._ptr, self._len = self.streaming_buffer:get()
     self._used = 0
+    self._total_get = self._total_get + self._len
 end
 
 function httputil.StreamingParser:unused()
@@ -629,6 +630,7 @@ end
 
 function httputil.StreamingParser:shift(bytes)
     self._used = self._used + bytes
+    self._total_used = self._total_used + bytes
 end
 
 function httputil.StreamingParser:substrbytes(bytes)
@@ -665,20 +667,16 @@ function httputil.StreamingParser:possible_boundary()
 end
 
 function httputil.StreamingParser:buffer_keep_unused()
-    local buf_start_ptr, sz = self._read_buffer:get()
+    local buf_start_ptr, sz = self.streaming_buffer:get()
     local all_used = self._ptr - buf_start_ptr + self._used
-    print("gary in buffer_keep_unused",self._ptr - buf_start_ptr , self._used, all_used)
-    --if sz > 0 then 
-    --    -- _read_buffer remain some data
-    --    self._read_buffer:pop_left(all_used)
-    --else
-        -- _read_buffer had been clear
-        self._read_buffer:append_right(self:unused(), self:unused_len())
-    --end
+    if self:unused_len() > 0 then
+        self.streaming_buffer:pop_left(all_used)
+    else
+        self.streaming_buffer:clear()
+    end
 end
 
 function httputil.StreamingParser:parse_large_multipart_body(chunk)
-    print("gary in parse_large_multipart_body")
     self:load_chunk(chunk)
     assert(self.boundary, "need boundary")
 
@@ -699,14 +697,10 @@ function httputil.StreamingParser:parse_large_multipart_body(chunk)
         self.state = state
     until next_state == false
 
-    if self:unused_len() > 0 then
-        print("gary before buffer_keep_unused", self:unused_len())
-        self:buffer_keep_unused()
-    end
+    self:buffer_keep_unused()
 end
 
 function httputil.StreamingParser:_state_begin_boundary()
-    print("gary in _state_begin_boundary", self:unused_len())
     local start_offset = self:strfind(self.begin_boundary, self.next_boundary_size -2)
     if start_offset then
         -- ignore all data before begin boundary
@@ -718,7 +712,6 @@ function httputil.StreamingParser:_state_begin_boundary()
 end
 
 function httputil.StreamingParser:_state_part_headers()
-    print("gary in _state_part_headers", self:unused_len())
     local start_offset = self:strfind(ffi.cast("char*", "\r\n\r\n"), 4)
     if start_offset ~= nil then
         if start_offset > 512 then error("part header too long") end
@@ -745,16 +738,15 @@ end
 
 
 function httputil.StreamingParser:_state_part_body()
-    print("gary in _state_part_body", self:unused_len())
     local boundary_size = self.next_boundary_size
     local nb_start_offset = self:strfind(self.next_boundary, self.next_boundary_size)
     local cb_start_offset = self:strfind(self.close_boundary, self.close_boundary_size)
     local is_large_body = false
     if self:unused_len() >= self.large_body_bytes then
         if nb_start_offset then
-            is_large_body = nb_start_offset >= self.large_body_bytes 
+            is_large_body = nb_start_offset >= self.large_body_bytes
         elseif cb_start_offset then
-            is_large_body = cb_start_offset >= self.large_body_bytes 
+            is_large_body = cb_start_offset >= self.large_body_bytes
         else
             is_large_body = true
         end
@@ -765,6 +757,7 @@ function httputil.StreamingParser:_state_part_body()
         assert(file, "open file faild:" .. tmpname)
         self._tmpname = tmpname
         self._tmpfile = file
+        self._tmplen = 0
         return "large_body"
     elseif nb_start_offset then
         self:_push_streaming_multipart_body(self:substrbytes(nb_start_offset))
@@ -792,9 +785,7 @@ function httputil.StreamingParser:_push_streaming_multipart_body(body_string)
     end
 end
 
-
 function httputil.StreamingParser:_state_part_large_body()
-    print("gary in _state_part_large_body", self:unused_len())
     local boundary_size = self.next_boundary_size
     local nb_start_offset = self:strfind(self.next_boundary, self.next_boundary_size)
     local cb_start_offset = self:strfind(self.close_boundary, self.close_boundary_size)
@@ -810,25 +801,25 @@ function httputil.StreamingParser:_state_part_large_body()
     end
 
     if nb_start_offset then
-        ffi.C.fwrite(self:unused(), nb_start_offset, 1, file)
+        self:_write_to_file(nb_start_offset, file)
         self:_push_streaming_multipart_large_body()
-        collectgarbage()
         self:shift(nb_start_offset + boundary_size)
+        collectgarbage()
         return "headers"
     elseif cb_start_offset then
-        ffi.C.fwrite(self:unused(), cb_start_offset, 1, file)
+        self:_write_to_file(cb_start_offset, file)
         self:_push_streaming_multipart_large_body()
         self:shift(cb_start_offset + boundary_size)
         collectgarbage()
         return "close"
-    elseif self:unused_len() >= 3*boundary_size then
+    elseif self:unused_len() >= 2*boundary_size then
         -- to keep possiblely boundary data in buffer for checking in next reading
         local offset = self:possible_boundary()
         if offset ~= nil then
-            ffi.C.fwrite(self:unused(), offset, 1, file)
+            self:_write_to_file(offset, file)
             self:shift(offset)
         else
-            ffi.C.fwrite(self:unused(), self:unused_len(), 1, file)
+            self:_write_to_file(self:unused_len(), file)
             self:shift(self:unused_len())
         end
         collectgarbage()
@@ -838,6 +829,13 @@ function httputil.StreamingParser:_state_part_large_body()
     end
 end
 
+function httputil.StreamingParser:_write_to_file(len, file)
+    ffi.C.fwrite(self:unused(), len, 1, file)
+    ffi.C.fflush(file)
+    self._tmplen = self._tmplen + len
+end
+
+
 function httputil.StreamingParser:_push_streaming_multipart_large_body()
     local name = self._name
     local arguments = self.arguments
@@ -845,9 +843,11 @@ function httputil.StreamingParser:_push_streaming_multipart_large_body()
     self._tmpfile:close()
     argument[1] = string.format("(save in %s)", self._tmpname)
     argument["filepath"] = self._tmpname
+    argument["filelen"] = tonumber(self._tmplen)
     self._tmpname = nil
     self._tmpfile = nil
     self._name = nil
+    self._tmplen = nil
 end
 
 function httputil.StreamingParser:_state_close()

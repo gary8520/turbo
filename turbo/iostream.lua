@@ -197,6 +197,7 @@ function iostream.IOStream:read_until(delimiter, callback, arg)
     self._read_callback = callback
     self._read_callback_arg = arg
     self._read_scan_offset = 0
+    self._raw_buffer = false
     self:_initial_read()
 end
 
@@ -214,6 +215,7 @@ function iostream.IOStream:read_until_pattern(pattern, callback, arg)
     self._read_callback_arg = arg
     self._read_pattern = pattern
     self._read_scan_offset = 0
+    self._raw_buffer = false
     self:_initial_read()
 end
 
@@ -240,14 +242,22 @@ function iostream.IOStream:read_bytes(num_bytes, callback, arg,
     self._read_callback_arg = arg
     self._streaming_callback = streaming_callback
     self._streaming_callback_arg = streaming_arg
+    self._raw_buffer = false
     self:_initial_read()
 end
 
 function iostream.IOStream:read_bytes_raw_buffer(num_bytes, callback, arg,
     streaming_callback, streaming_arg)
+    assert((not self._read_callback), "Already reading.")
+    assert(type(num_bytes) == 'number',
+        'argument #1, num_bytes, is not a number')
+    self._read_bytes = num_bytes
+    self._read_callback = callback
+    self._read_callback_arg = arg
+    self._streaming_callback = streaming_callback
+    self._streaming_callback_arg = streaming_arg
     self._raw_buffer = true
-    self:read_bytes(num_bytes, callback, arg,
-    streaming_callback, streaming_arg)
+    self:_initial_read()
 end
 
 
@@ -280,6 +290,7 @@ function iostream.IOStream:read_until_close(callback, arg, streaming_callback,
     self._read_callback_arg = arg
     self._streaming_callback = streaming_callback
     self._streaming_callback_arg = streaming_arg
+    self._raw_buffer = false
     self:_add_io_state(ioloop.READ)
 end
 
@@ -648,14 +659,11 @@ if platform.__LINUX__ and not _G.__TURBO_USE_LUASOCKET__ then
                                    TURBO_SOCKET_BUFFER_SZ < buffer_left and
                                        TURBO_SOCKET_BUFFER_SZ or buffer_left,
                                    0))
-                                   print("gary after recv", sz)
         if sz == -1 then
             errno = ffi.errno()
             if errno == EWOULDBLOCK or errno == EAGAIN then
-                print("gary errno == EWOULDBLOCK or errno == EAGAIN", errno)
                 return
             elseif errno == ECONNRESET then
-                print("gary errno == ECONNERESET", errno)
                 self:close()
                 return nil
             else
@@ -736,9 +744,7 @@ end
 --- Read from the socket and append to the read buffer.
 --  @return Amount of bytes appended to self._read_buffer.
 function iostream.IOStream:_read_to_buffer()
-    print("gary in _read_tobuffer", debug.traceback())
     local ptr, sz, closed = self:_read_from_socket()
-    print("gary in _read_to_buffer after _read_from_socket", ptr, sz)
     if not ptr then
         if closed then
             self:close()
@@ -748,7 +754,6 @@ function iostream.IOStream:_read_to_buffer()
     end
     self._read_buffer:append_right(ptr, sz)
     self._read_buffer_size = self._read_buffer_size + sz
-    print("gary after append_right", ptr, sz, self._read_buffer_size)
     if closed then
         self:close()
     end
@@ -771,29 +776,30 @@ end
 --- Attempts to complete the currently pending read from the buffer.
 -- @return (Boolean) Returns true if the enqued read was completed, else false.
 function iostream.IOStream:_read_from_buffer()
-    print("gary in read_from_buffer", self._streaming_callback , self._read_buffer_size )
     -- Handle streaming callbacks first.
     if self._streaming_callback ~= nil and self._read_buffer_size ~= 0 then
-        print"gary to be streaming"
         local bytes_to_consume = self._read_buffer_size
+        local success
         if self._read_bytes ~= nil then
             bytes_to_consume = min(self._read_bytes, bytes_to_consume)
             self._read_bytes = self._read_bytes - bytes_to_consume
             --self:_run_callback(self._streaming_callback,
             --    self._streaming_callback_arg,
             --    self:_consume(bytes_to_consume))
-            self._streaming_callback(self._streaming_callback_arg, self:_consume(bytes_to_consume))
+            success = xpcall(self._streaming_callback, _run_callback_error_handler,
+                self._streaming_callback_arg, self:_consume(bytes_to_consume))
         else
             --self:_run_callback(self._streaming_callback,
             --    self._streaming_callback_arg,
             --    self:_consume(bytes_to_consume))
-            self._streaming_callback(self._streaming_callback_arg, self:_consume(bytes_to_consume))
+            success = xpcall(self._streaming_callback, _run_callback_error_handler,
+                self._streaming_callback_arg, self:_consume(bytes_to_consume))
         end
+        if not success then self:close() end
     end
     -- Handle read_bytes.
     if self._read_bytes ~= nil and
         self._read_buffer_size >= self._read_bytes then
-        print("gary _read_bytes ~= nil")
         local num_bytes = self._read_bytes
         local callback = self._read_callback
         local arg = self._read_callback_arg
@@ -803,6 +809,7 @@ function iostream.IOStream:_read_from_buffer()
         self._streaming_callback_arg = nil
         self._read_bytes = nil
         self:_run_callback(callback, arg, self:_consume(num_bytes))
+        self._raw_buffer = nil
         return true
     -- Handle read_until.
     elseif self._read_delimiter ~= nil then
@@ -834,6 +841,7 @@ function iostream.IOStream:_read_from_buffer()
                 else
                     self:_run_callback(callback, self:_consume(delimiter_end))
                 end
+                self._raw_buffer = nil
                 return true
             end
             self._read_scan_offset = sz
@@ -860,6 +868,7 @@ function iostream.IOStream:_read_from_buffer()
                 self:_run_callback(callback, arg, self:_consume(
                     s_end + self._read_scan_offset))
                 self._read_scan_offset = s_end
+                self._raw_buffer = nil
                 return true
             end
             self._read_scan_offset = sz
@@ -1027,24 +1036,20 @@ end
 --- Add IO state to IOLoop.
 -- @param state (Number) IOLoop state to set.
 function iostream.IOStream:_add_io_state(state)
-    print("gary in _add_io_state", state)
     if not self.socket then
         -- Connection has been closed, ignore request.
         return
     end
     if not self._state then
-        print("gary in not self._state")
         self._state = bitor(ioloop.ERROR, state)
         self.io_loop:add_handler(self.socket,
             self._state,
             self._handle_events,
             self)
     elseif bitand(self._state, state) == 0 then
-        print("gary in bitand(self._state, state) == 0")
         self._state = bitor(self._state, state)
         self.io_loop:update_handler(self.socket, self._state)
     end
-    print("end of _add_io_state",debug.traceback())
 end
 
 function iostream.IOStream:_consume(loc)
