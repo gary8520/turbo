@@ -579,18 +579,13 @@ function httputil.StreamingParser:initialize(serverhandle)
         boundary = "--" .. boundary
         local begin_boundary = boundary
         local next_boundary = "\r\n" .. boundary
-        local close_boundary = "\r\n" .. boundary .. "--"
         local next_boundary_size = #next_boundary
-        local close_boundary_size = #close_boundary
         self.boundary = boundary
-	self.begin_boundary_lua = begin_boundary
-	self.next_boundary_lua = next_boundary
-	self.close_boundary_lua = close_boundary
+        self.begin_boundary_lua = begin_boundary
+        self.next_boundary_lua = next_boundary
         self.begin_boundary = ffi.cast("char *", begin_boundary)
         self.next_boundary = ffi.cast("char *", next_boundary)
-        self.close_boundary = ffi.cast("char *", close_boundary)
         self.next_boundary_size = next_boundary_size
-        self.close_boundary_size = close_boundary_size
     end
 
     self.consumed_bytes = 0
@@ -724,6 +719,11 @@ function httputil.StreamingParser:_state_begin_boundary()
 end
 
 function httputil.StreamingParser:_state_part_headers()
+    -- close boundary end with "--"
+    if ffi.string(self:unused(), 2) == "--" then
+        self:shift(2)
+        return "close"
+    end
     local start_offset = self:strfind(ffi.cast("char*", "\r\n\r\n"), 4)
     if start_offset ~= nil then
         if start_offset > 512 then error("part header too long") end
@@ -751,13 +751,10 @@ end
 
 function httputil.StreamingParser:_state_part_body()
     local nb_start_offset = self:strfind(self.next_boundary, self.next_boundary_size)
-    local cb_start_offset = self:strfind(self.close_boundary, self.close_boundary_size)
     local is_large_body = false
     if self:unused_len() >= self.large_body_bytes then
         if nb_start_offset then
             is_large_body = nb_start_offset >= self.large_body_bytes
-        elseif cb_start_offset then
-            is_large_body = cb_start_offset >= self.large_body_bytes
         else
             is_large_body = true
         end
@@ -770,14 +767,10 @@ function httputil.StreamingParser:_state_part_body()
         self._tmpfile = file
         self._tmplen = 0
         return "large_body"
-    elseif nb_start_offset and ( not cb_start_offset or (cb_start_offset - nb_start_offset)>0)then
+    elseif nb_start_offset then
         self:_push_streaming_multipart_body(self:substrbytes(nb_start_offset))
         self:shift(nb_start_offset + self.next_boundary_size)
         return "headers"
-    elseif cb_start_offset then
-        self:_push_streaming_multipart_body(self:substrbytes(cb_start_offset))
-        self:shift(cb_start_offset + self.close_boundary_size)
-        return "close"
     else
         return false
     end
@@ -798,7 +791,6 @@ end
 
 function httputil.StreamingParser:_state_part_large_body()
     local nb_start_offset = self:strfind(self.next_boundary, self.next_boundary_size)
-    local cb_start_offset = self:strfind(self.close_boundary, self.close_boundary_size)
     local tmpname = self._tmpname
     if not tmpname then
         tmpname = os.tmpname()
@@ -810,18 +802,11 @@ function httputil.StreamingParser:_state_part_large_body()
         self._tmpfile = file
     end
 
-    if  nb_start_offset and ( not cb_start_offset or (cb_start_offset - nb_start_offset)>0) then
+    if  nb_start_offset then
         self:_write_to_file(nb_start_offset, file)
         self:_push_streaming_multipart_large_body()
         self:shift(nb_start_offset + self.next_boundary_size)
-        collectgarbage()
         return "headers"
-    elseif cb_start_offset then
-        self:_write_to_file(cb_start_offset, file)
-        self:_push_streaming_multipart_large_body()
-        self:shift(cb_start_offset + self.close_boundary_size)
-        collectgarbage()
-        return "close"
     elseif self:unused_len() >= 2*self.next_boundary_size then
         -- to keep possiblely boundary data in buffer for checking in next reading
         local offset = self:possible_boundary()
@@ -832,7 +817,6 @@ function httputil.StreamingParser:_state_part_large_body()
             self:_write_to_file(self:unused_len(), file)
             self:shift(self:unused_len())
         end
-        collectgarbage()
         return false
     else
         return false
@@ -862,7 +846,6 @@ end
 
 function httputil.StreamingParser:_state_close()
     self:shift(self:unused_len())
-    collectgarbage()
     return false
 end
 
