@@ -696,11 +696,16 @@ function httputil.StreamingParser:parse_large_multipart_body(chunk)
     }
 
     -- state transfer
-    local next_state
+    local success, next_state
     local state = self.state
     repeat
-        next_state = state_function_map[state](self)
-        state = next_state or state
+        success, next_state = pcall(state_function_map[state], self)
+        if success then
+            state = next_state or state
+        else
+            self:_exception_handler(next_state)
+            state = "close"
+        end
         self.state = state
     until self:unused_len()<1 or next_state == false
 
@@ -847,6 +852,28 @@ end
 function httputil.StreamingParser:_state_close()
     self:shift(self:unused_len())
     return false
+end
+
+function httputil.StreamingParser:_exception_handler(errstr)
+    -- close/delete the unfinish file
+    if self._tmpfile then self._tmpfile:close() end
+    if self._tmpname then os.remove(self._tmpname) end
+    
+    -- delete all other file saved in this request
+    local arguments = self.arguments
+    if arguments then
+        for name, argms in pairs(arguments) do
+            for i, argument in ipairs(argms) do
+                os.remove(argument["filepath"])
+            end
+        end
+    end
+
+    if type(errstr) ~= "string" then
+        errstr = "exception"
+    end
+    -- cast out the error to iostream
+    error(errstr)
 end
 
 
